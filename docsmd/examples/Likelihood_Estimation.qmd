@@ -1,0 +1,184 @@
+---
+title: Likelihood Estimation
+jupyter: python3
+---
+
+
+_Author: Valentin Pratz_
+
+The likelihood function $p(x|\theta)$ describes the distribution of data $x$ conditional on parameters $\theta$.
+While posterior estimation is the predominant use-case in BayesFlow, estimating likelihoods is possible as well.
+There are two main motivations to approximate a likelihood.
+First, one might want to estimate the _density_ of data $x$ for given parameters $\theta$, which is not possible if one only has access to a simulator.
+Second, one might want to train an approximate _synthetic likelihood_ for faster sampling, leveraging the interpolation capacities of neural networks.
+
+Performing likelihood estimation instead of posterior estimation requires only minor modifications to the pipeline.
+We will demonstrate the basic steps on a simple toy example below.
+If you have an idea for a more interesting case study, please make a pull request or reach out to us.
+
+## Toy Example
+
+We will use a very simple toy example, a bi-modal distribution obtained by mirroring a two-dimensional Gaussian at the origin. For simplicity, we only use the mean as a parameter, and use a fixed diagonal covariance matrix.
+
+
+```{python}
+#| ExecuteTime: {end_time: '2026-01-19T12:59:58.479109Z', start_time: '2026-01-19T12:59:58.467517Z'}
+import os
+
+if not os.environ.get("KERAS_BACKEND"):
+    # Set to your favorite backend
+    os.environ["KERAS_BACKEND"] = "jax"
+```
+
+```{python}
+#| ExecuteTime: {end_time: '2026-01-19T13:00:00.438080Z', start_time: '2026-01-19T12:59:59.282148Z'}
+import numpy as np
+import matplotlib.pyplot as plt
+
+import bayesflow as bf
+```
+
+```{python}
+#| ExecuteTime: {end_time: '2026-01-19T13:00:00.447973Z', start_time: '2026-01-19T13:00:00.440275Z'}
+rng = np.random.default_rng()
+```
+
+```{python}
+#| ExecuteTime: {end_time: '2026-01-19T13:00:00.456692Z', start_time: '2026-01-19T13:00:00.449669Z'}
+def likelihood(theta):
+    loc = theta if rng.random() > 0.5 else -theta
+    return {"x": rng.normal(loc=loc, scale=0.2, size=theta.shape)}
+```
+
+The likelihood $p(x|\theta)$ is conditional on $\theta$. As we know how we can produce as simulations, we can already look at samples from the likelihood for a given $\theta$. The simulator serves as an _implicit likelihood_. Below, we specify the simulator with a fixed parameter that is passed to the likelihood function. We can then sample from the likelihood, and plot the resulting samples.
+
+```{python}
+#| ExecuteTime: {end_time: '2026-01-19T13:00:02.022042Z', start_time: '2026-01-19T13:00:02.012156Z'}
+theta_0 = np.array([1.0, 1.0])
+
+def params():
+    return {"theta": theta_0}
+
+simulator = bf.make_simulator([params, likelihood])
+```
+
+```{python}
+#| ExecuteTime: {end_time: '2026-01-19T13:00:02.419112Z', start_time: '2026-01-19T13:00:02.269331Z'}
+sims = simulator.sample(5000)
+sims["x"].shape
+```
+
+```{python}
+#| ExecuteTime: {end_time: '2026-01-19T13:00:02.820548Z', start_time: '2026-01-19T13:00:02.664950Z'}
+f, ax = plt.subplots(1, 1, figsize=(5, 5))
+ax.scatter(*sims["x"].T, s=2, alpha=0.3, color="#132a70")
+ax.set_xlabel("$\\theta_1$")
+ax.set_ylabel("$\\theta_2$")
+ax.set_aspect("equal", "box")
+```
+
+While we could use those samples to produce an estimation of the likelihood for this specific parameter value, we often want to obtain an estimation for a range of parameter values. Similar to the prior distribution in posterior estimation, we can specify a function that randomly produces parameter values we are interested in. 
+
+As we are estimating the likelihood $p(x|\theta)$, which is conditional on $\theta$, how this function looks like will not change the "ground truth" we aim to estimate. In contrast, changing the prior in posterior estimation also changes the true posterior.
+
+In practice, different choices of this function can lead to different approximation results, as it determines how many simulations the approximator sees for each parameter region. Here, we choose a uniform distribution in the range from -2 to 2.
+
+```{python}
+#| ExecuteTime: {end_time: '2026-01-19T13:00:03.483017Z', start_time: '2026-01-19T13:00:03.475262Z'}
+def params():
+    theta = rng.uniform(-2, 2, (2,))
+    return {"theta": theta}
+
+simulator = bf.make_simulator([params, likelihood])
+```
+
+## Training
+
+We are now ready to do the actual likelihood estimation. We want to learn the likelihood of the data $x$ conditional on the parameters $\theta$. Therefore, we use the parameters as `inference_conditions`, and the data as `inference_variables`. We do not use a summary network, so no `summary_conditions` are present. We can use a `BasicWorkflow`, which allows us to easily specify the necessary parameters.
+
+`CouplingFlow`s are nice, because they enable fast sampling and likelihood evaluation, but they can struggle with multimodal distributions. Therefore, we will use a diffusion model at the cost of largely increased inference time. What one would choose in practice depends on the speed-accuracy trade-off.
+
+Accurate likelihood approximation can require a lot of training samples, especially when the distributions are complex and high-dimensional!
+
+```{python}
+#| ExecuteTime: {end_time: '2026-01-19T13:00:04.533064Z', start_time: '2026-01-19T13:00:04.130604Z'}
+workflow = bf.BasicWorkflow(
+    simulator=simulator,
+    inference_network=bf.networks.DiffusionModel(),
+    inference_variables="x",
+    inference_conditions="theta",
+    initial_learning_rate=1e-3,
+    standardize=None
+)
+```
+
+Training will take around 2 minutes using JAX on a CPU.
+
+```{python}
+#| ExecuteTime: {end_time: '2026-01-19T13:02:12.735500Z', start_time: '2026-01-19T13:00:05.260229Z'}
+history = workflow.fit_online(epochs=30, num_batches_per_epoch=500, batch_size=64, validation_data=1024)
+```
+
+```{python}
+#| ExecuteTime: {end_time: '2026-01-19T13:02:16.522059Z', start_time: '2026-01-19T13:02:16.397504Z'}
+f = bf.diagnostics.plots.loss(history)
+```
+
+## Evaluation
+
+We can now sample from the approximate likelihood by specifying $\theta_0$ as the condition. Generating 5000 samples from the approximate likelihood should take around 2 seconds using JAX on CPU.
+
+```{python}
+#| ExecuteTime: {end_time: '2026-01-19T13:02:27.039536Z', start_time: '2026-01-19T13:02:17.648030Z'}
+%%time
+approx_samples = workflow.sample(num_samples=5000, conditions={"theta": theta_0[None]})
+```
+
+```{python}
+#| ExecuteTime: {end_time: '2026-01-19T13:02:28.085317Z', start_time: '2026-01-19T13:02:28.062551Z'}
+approx_samples['x'].shape
+```
+
+```{python}
+#| ExecuteTime: {end_time: '2026-01-19T13:02:28.688372Z', start_time: '2026-01-19T13:02:28.604019Z'}
+f, ax = plt.subplots(1, 1, figsize=(5, 5))
+ax.scatter(*approx_samples["x"][0].T, s=2, alpha=0.3, color="#132a70")
+ax.set_xlabel("$\\theta_1$")
+ax.set_ylabel("$\\theta_2$")
+ax.set_aspect("equal", "box")
+```
+
+You might have noticed that we could already sample before training, as we needed this to actually train our model.
+Now, with the trained model, we can evaluate the likelihood density as well, which was not possible before.
+Below, we make a two-dimensional plot of the density for a given set of parameters.
+
+```{python}
+#| ExecuteTime: {end_time: '2026-01-19T13:02:29.513349Z', start_time: '2026-01-19T13:02:29.500907Z'}
+nx_1, nx_2 = (25, 25)
+x_1 = np.linspace(-2, 2, nx_1)
+x_2 = np.linspace(-2, 2, nx_2)
+vx_1, vx_2 = np.meshgrid(x_1, x_2)
+xvals = np.stack([np.reshape(vx_1, (-1,)), np.reshape(vx_2, (-1,))], axis=-1)
+```
+
+```{python}
+#| ExecuteTime: {end_time: '2026-01-19T13:02:53.148871Z', start_time: '2026-01-19T13:02:46.501744Z'}
+log_density = workflow.log_prob(data={"x": xvals, "theta": np.repeat(theta_0[None], xvals.shape[0], axis=0),})
+```
+
+```{python}
+#| ExecuteTime: {end_time: '2026-01-19T13:03:40.987011Z', start_time: '2026-01-19T13:03:40.827759Z'}
+f, ax = plt.subplots(1, 1, figsize=(5, 5))
+cf = ax.contourf(x_1, x_2, np.reshape(np.exp(log_density), (nx_1, nx_2)))
+ax.set_xlabel("$x_1$")
+ax.set_ylabel("$x_2$")
+ax.set_aspect("equal", "box")
+cbar = f.colorbar(cf, ax=ax)
+```
+
+## Further Steps
+
+In this notebook, we presented the fundamentals of likelihood estimation with BayesFlow, but did not go into much detail regarding training details or network architectures.
+In practice, we advise to start with a simpler inference network like `CouplingFlow`s, and a moderate amount of training samples.
+To improve performance, you can experiment with hyperparameters (learning rate, batch size, epochs, ...), and, depending on your setting, increase the number of training samples or move to a slower but more expressive architecture like `FlowMatching` or `DiffusionModel`.
+
