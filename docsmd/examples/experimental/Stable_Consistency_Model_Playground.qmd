@@ -1,0 +1,149 @@
+---
+title: Amortization with Stable Consistency Models
+jupyter: python3
+---
+
+
+_Authors: Valentin Pratz_ \& Stefan T. Radev
+
+
+```{python}
+#| ExecuteTime: {end_time: '2024-10-24T08:36:22.149034Z', start_time: '2024-10-24T08:36:20.807192Z'}
+import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
+
+import bayesflow as bf
+
+import keras
+
+from bayesflow.experimental import StableConsistencyModel
+```
+
+This notebook serves as a playground for testing continuous-time consistency models. They are still experimental, as they are not fully tested yet, so please use them at your own discretion and share potential successes/failures. This will help us to judge their usefulness in the context of SBI. Later on, this notebook might evolve into a full tutorial notebook. For now, please refer to the starter notebook if you encounter concepts that are not explained.
+
+## Simulator and Training Data
+
+```{python}
+simulator = bf.simulators.TwoMoons()
+```
+
+```{python}
+train_data = simulator.sample(2048)
+val_data = simulator.sample(512)
+```
+
+```{python}
+#| ExecuteTime: {end_time: '2024-10-24T08:36:26.618926Z', start_time: '2024-10-24T08:36:26.614443Z'}
+adapter = (
+    bf.adapters.Adapter()
+    .rename("parameters", "inference_variables")
+    .rename("observables", "inference_conditions")
+)
+```
+
+## sCM Model
+
+```{python}
+#| ExecuteTime: {end_time: '2024-09-23T14:39:53.339590Z', start_time: '2024-09-23T14:39:53.319852Z'}
+inference_network = StableConsistencyModel(embedding_kwargs={"embed_dim": 2})
+```
+
+## Workflow and Training
+
+We use the high-level `Workflow` API:
+
+```{python}
+#| ExecuteTime: {end_time: '2024-09-23T14:42:36.067393Z', start_time: '2024-09-23T14:39:53.513436Z'}
+workflow = bf.BasicWorkflow(
+    adapter=adapter, 
+    simulator=simulator,
+    inference_network=inference_network,
+)
+```
+
+```{python}
+history = workflow.fit_offline(
+    data=train_data, 
+    epochs=1000,
+    batch_size=128,
+    validation_data=val_data
+)
+```
+
+## Posterior Sampling
+
+```{python}
+# Set the number of posterior draws you want to get
+num_samples = 3000
+steps = 15
+rho = 3.5
+
+# Obtain samples from amortized posterior
+conditions = {"observables": np.array([[0.0, 0.0]]).astype("float32")}
+samples_0 = workflow.approximator.sample(conditions=conditions, num_samples=num_samples)
+samples = samples_0["parameters"][0]
+
+# Prepare figure
+f, ax = plt.subplots(1, 1, figsize=(6, 6))
+
+color ="#153c7a"
+
+# Plot samples
+ax.scatter(samples[:, 0], samples[:, 1], color=color, alpha=0.75, s=1)
+sns.despine(ax=ax)
+ax.grid(alpha=0.3)
+ax.set_aspect("equal", adjustable="box")
+ax.set_xlabel(r"$\theta_1$", fontsize=15)
+ax.set_ylabel(r"$\theta_2$", fontsize=15)
+
+f.tight_layout()
+```
+
+Plot the discretization schedule:
+
+```{python}
+discretized_time = np.flip(keras.ops.convert_to_numpy(inference_network._discretize_time(steps, rho=rho)))
+plt.plot(discretized_time, marker="x", linestyle="dotted")
+plt.ylabel("t")
+plt.xlabel("step")
+plt.ylim(0.0, np.pi / 2)
+plt.xlim(0, len(discretized_time) - 1)
+plt.yticks(
+    [0.0, np.pi / 8, np.pi / 4, 3 * np.pi / 8, np.pi / 2],
+    labels=["0", r"$\pi/8$", r"$\pi/4$", r"$3\pi/8$", r"$\pi/2$"],
+)
+plt.grid()
+_ = plt.title("Discretization schedule")
+```
+
+Plot the time embedding:
+
+```{python}
+t = keras.ops.linspace(0.001, np.pi / 2, 500)[:, None]
+emb = inference_network.time_emb(t)
+plt.plot(keras.ops.convert_to_numpy(t)[:, 0], keras.ops.convert_to_numpy(emb))
+plt.ylabel("emb(t)")
+plt.xlabel("t")
+plt.xticks([0.0, np.pi / 4, np.pi / 2], labels=["0", r"$\pi/4$", r"$\pi/2$"])
+_ = plt.title("Time embedding")
+```
+
+Plot the learned adaptive weighting function:
+
+```{python}
+plt.plot(t, inference_network.weight_fn_projector(inference_network.weight_fn(t)))
+plt.plot(t, 1 / (inference_network.sigma * np.tan(t)))
+plt.plot(
+    t,
+    inference_network.weight_fn_projector(inference_network.weight_fn(t))
+    / (inference_network.sigma * np.tan(t)),
+)
+plt.ylabel(r"$w_\phi(t)$")
+plt.xlabel("t")
+plt.yscale("log")
+plt.xticks([0.0, np.pi / 4, np.pi / 2], labels=["0", r"$\pi/4$", r"$\pi/2$"])
+_ = plt.title("Learned adaptive weighting function")
+```
+
+
