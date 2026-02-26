@@ -1,0 +1,21 @@
+---
+title: Inference Networks
+jupyter: python3
+---
+
+
+*Disclaimer: This guide is in an early stage. We welcome contributions to the guide in form of issues and pull requests.*
+
+Inference networks form the backbone of neural amortized Bayesian inference methods. They are generative models (usually _invertible_ ones, but they do not have to be), that can transform samples from a simple distribution (e.g., a unit Gaussian) to a complicated one (e.g., a posterior distribution).
+
+You can find the inference networks in the {py:mod}`~bayesflow.networks` module. You can identify them by the "Bases: {py:class}`~bayesflow.networks.InferenceNetwork`" label.
+
+## CouplingFlow
+
+The {py:class}`~bayesflow.networks.CouplingFlow` is the traditional inference network in SBI. It features fast inference, but can lack expressivity, especially when the density changes quickly (e.g., at the bounds of a uniform distribution). For training, it uses a negative log-likelihood loss, so the loss is indicative of the performance (lower is better, but zero has no special meaning).
+
+## FlowMatching
+
+{py:class}`~bayesflow.networks.FlowMatching` is a continuous flow, and one of the most expressive architectures currently available. We recommend it for more complex models and posteriors. The expressivity comes at the cost of inference speed, as inference requires solving an ordinary differential equation (ODE), which requires many network passes. In addition, after an initial drop, the loss is not indicative of the performance anymore, so one has to rely on different means to evaluate performance during training (or just hope for the best and evaluate after training).
+
+
