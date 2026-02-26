@@ -1,0 +1,470 @@
+---
+title: Bayesian Linear Regression Starter
+jupyter: python3
+---
+
+
+_Authors: Paul Bürkner, Lars Kühmichel, Stefan T. Radev_
+
+
+## Introduction
+
+Welcome to the very first tutorial on using BayesFlow for amortized posterior estimation! In this notebook, we will estimate a linear regression model and illustrate some features of the library along the way. This tutorial introduces the lower-level interface, which allows full control over all network and training parameters, as well as passing of all familiar `keras` callback functions.
+
+In traditional Bayesian inference, we seek to approximate the posterior distribution of model parameters given observed data for each new data instance separately. This process can be computationally expensive, especially for complex models or large datasets, because it often involves iterative optimization or sampling methods. This step needs to be repeated for each new instance of data.
+
+Amortized Bayesian inference offers a solution to this problem. “Amortization” here refers to spreading out the computational cost over multiple instances. Instead of computing a new posterior from scratch for each data instance, amortized inference learns a function. This function is parameterized by a neural network that directly maps observations to an approximate posterior. This function is trained over the dataset to approximate the posterior for *any* new data instance efficiently. In this example, we will use a simple regression model to illustrate the basic concepts of amortized posterior estimation.
+
+```{python}
+import os
+
+if not os.environ.get("KERAS_BACKEND"):
+    # Set to your favorite backend
+    os.environ["KERAS_BACKEND"] = "tensorflow"
+```
+
+```{python}
+#| ExecuteTime: {end_time: '2025-02-14T10:51:27.573003Z', start_time: '2025-02-14T10:51:27.568939Z'}
+import numpy as np
+from pathlib import Path
+
+import keras
+import bayesflow as bf
+```
+
+BayesFlow offers flexible modules you can adapt to different Amortized Bayesian Inference (ABI) workflows. In brief:
+
+* The module `simulators` contains high-level wrappers for gluing together priors, simulators, and meta-functions, and generating all quantities of interest for a modeling scenario.
+* The module `adapters` contains utilities that preprocess the generated data from the simulator to a format more friendly for the neural approximators.
+* The module `networks` contains the core neural architecture used for various tasks, e.g., a generative `FlowMatching` architecture for approximating distributions, or a `SetTransformer` for learning permutation-invariant summary representations (embeddings).
+* The module `appoximators` contains high-level wrappers which connect the various networks together and instruct them about their particular goals in the inference pipeline.
+
+In this notebook we will take components from each of these modules and show how they work together.
+
+```{python}
+#| ExecuteTime: {end_time: '2025-02-14T10:51:29.022618Z', start_time: '2025-02-14T10:51:29.021037Z'}
+# avoid scientific notation for outputs
+np.set_printoptions(suppress=True)
+```
+
+## Generative Model
+
+From the perspective of BayesFlow, a generative model is more than just a prior (encoding beliefs about the parameters before observing data) and a data simulator (a likelihood function, often implicit, that generates data given parameters). 
+
+In addition, a model consists of various implicit context assumptions, which we can make explicit at any time. Furthermore, we can also amortize over these context variables, thus making our real-world inference more flexible (i.e., applicable to more contexts). We are leveraging the concept of amortized inference and extending it to context variables as well.
+
+We will start with our data simulator: 
+
+```{python}
+#| ExecuteTime: {end_time: '2025-02-14T10:51:29.067423Z', start_time: '2025-02-14T10:51:29.065675Z'}
+def likelihood(beta, sigma, N):
+    # x: predictor variable
+    x = np.random.normal(0, 1, size=N)
+    # y: response variable
+    y = np.random.normal(beta[0] + beta[1] * x, sigma, size=N)
+    return dict(y=y, x=x)
+```
+
+As inputs, it takes the regression coefficient vector `beta` (intercept and slope), the residual SD `sigma`, and the number of observations `N` to simulate both our predictor variable `x` and subsequently our response variable `y`. 
+
+```{python}
+#| ExecuteTime: {end_time: '2025-02-14T10:51:29.110035Z', start_time: '2025-02-14T10:51:29.107380Z'}
+data_draws = likelihood(beta = [2, 1], sigma = 1, N = 3)
+print(data_draws["y"].shape)
+print(data_draws["y"])
+```
+
+Next, we define our prior simulator to sample draws of the model parameters `beta` and `sigma`:
+
+```{python}
+#| ExecuteTime: {end_time: '2025-02-14T10:51:29.155916Z', start_time: '2025-02-14T10:51:29.153343Z'}
+def prior():
+    # beta: regression coefficients (intercept, slope)
+    beta = np.random.normal([2, 0], [3, 1])
+    # sigma: residual standard deviation
+    sigma = np.random.gamma(1, 1)
+    return dict(beta=beta, sigma=sigma)
+```
+
+```{python}
+#| ExecuteTime: {end_time: '2025-02-14T10:51:29.202304Z', start_time: '2025-02-14T10:51:29.198946Z'}
+prior_draws = prior()
+print(prior_draws["beta"].shape)
+print(prior_draws["beta"])
+```
+
+If we fix the number of observations `N`, the combination of likelihood and prior already fully defines our model simulator. However, we want to train BayesFlow to perform posterior approximations of linear regression models for *varying number of observations*. As such, we also need a simulator for `N`:
+
+```{python}
+#| ExecuteTime: {end_time: '2025-02-14T10:51:29.248509Z', start_time: '2025-02-14T10:51:29.245818Z'}
+def meta():
+    # N: number of observation in a dataset
+    N = np.random.randint(5, 15)
+    return dict(N=N)
+```
+
+```{python}
+#| ExecuteTime: {end_time: '2025-02-14T10:51:29.294585Z', start_time: '2025-02-14T10:51:29.292183Z'}
+meta_draws = meta()
+print(meta_draws["N"])
+```
+
+We can combine these three functions into a bayesflow simulator via:
+
+```{python}
+#| ExecuteTime: {end_time: '2025-02-14T10:51:29.339387Z', start_time: '2025-02-14T10:51:29.337157Z'}
+simulator = bf.simulators.make_simulator([prior, likelihood], meta_fn=meta)
+```
+
+We passed the `meta` simulator separately to the `meta_fn` argument to make sure
+that the number of observations `N` constant within each *batch* of simulated datasets. This is required since, within each batch, the generated datasets need to have the same shape for them to be easily transformable to tensors for deep learning.
+
+Let's see how sampling from the simulator works by sampling a batch of 500 datasets:
+
+```{python}
+#| ExecuteTime: {end_time: '2025-02-14T10:51:29.413332Z', start_time: '2025-02-14T10:51:29.381112Z'}
+#| colab: {base_uri: https://localhost:8080/}
+# Generate a batch of three training samples
+sim_draws = simulator.sample(500)
+print(sim_draws["N"])
+print(sim_draws["beta"].shape)
+print(sim_draws["sigma"].shape)
+print(sim_draws["x"].shape)
+print(sim_draws["y"].shape)
+```
+
+Let's define the parameter key and corresponding names of individual parameters for easy filtering and plotting down the line.
+
+```{python}
+#| ExecuteTime: {end_time: '2025-02-14T10:51:29.436310Z', start_time: '2025-02-14T10:51:29.434080Z'}
+par_keys = ["beta", "sigma"]
+par_names = [r"$\beta_0$", r"$\beta_1$", r"$\sigma$"]
+```
+
+```{python}
+#| ExecuteTime: {end_time: '2025-02-14T10:51:30.675639Z', start_time: '2025-02-14T10:51:29.479970Z'}
+f = bf.diagnostics.plots.pairs_samples(
+    samples=sim_draws,
+    variable_keys=par_keys,
+    variable_names=par_names
+)
+```
+
+## Adapter
+
+To ensure that the training data generated by the simulator can be used for deep learning, we have do a bunch of transformations via `adapter` objects. They provides multiple flexible functionalities, from standardization to renaming, and so on. 
+
+Below, we build our own `adapter` from scratch but later on, `BayesFlow` will also provide default adapters that will already automate most of the commonly required steps.
+
+```{python}
+#| ExecuteTime: {end_time: '2025-02-14T10:51:30.684080Z', start_time: '2025-02-14T10:51:30.681901Z'}
+#| colab: {base_uri: https://localhost:8080/}
+adapter = (
+    bf.Adapter()
+    .broadcast("N", to="x")
+    .as_set(["x", "y"])
+    .constrain("sigma", lower=0)
+    .sqrt("N")
+    .convert_dtype("float64", "float32")
+    .concatenate(["beta", "sigma"], into="inference_variables")
+    .concatenate(["x", "y"], into="summary_variables")
+    .rename("N", "inference_conditions")
+)
+```
+
+Let us discuss a few adapter steps in detail:
+
+The `.broadcast("N", to="x")` transform will copy the value of `N` batch-size times to ensure that it will also have a `batch_size` dimension even though it was actually just a single value, constant over all datasets within a batch. The batch dimension will be inferred from `x` (this needs to be present during inference).
+
+The `.as_set(["x", "y"])` transform indicates that both `x` and `y` are treated as sets. That is, their values will be treated as *exchangable* such that they will imply the same inference regardless of the values' order. This makes sense, since in linear regression, we can index the observations in arbitrary order and always get the same regression line.
+
+The `.constrain("sigma", lower=0)` transform ensures that the residual standard deviation parameter `sigma` will always be positive. Without this constrain, the neural networks may attempt to predict negative `sigma` which of course would not make much sense.
+
+Let's check the shape of our processed data to be passed to the neural networks:
+
+```{python}
+#| ExecuteTime: {end_time: '2025-02-14T10:51:30.726217Z', start_time: '2025-02-14T10:51:30.723437Z'}
+#| colab: {base_uri: https://localhost:8080/}
+processed_draws = adapter(sim_draws)
+print(processed_draws["summary_variables"].shape)
+print(processed_draws["inference_conditions"].shape)
+print(processed_draws["inference_variables"].shape)
+```
+
+Those shapes are as we expect them to be. The first dimenstion is always the batch size which was 500 for our example data. All variables adhere to this rule since the first dimension is indeed 500.
+
+For `summary_variables`, the second dimension is equal to the sampled valued of `N`. It's third dimension is `2`, since we have combined `x` and `y` into summary variables, each of which are vectors of length `N` within each simulated dataset.
+
+For `inference_conditions`, the second dimension is just `1` because we have passed only the scalar variable `N` there.
+
+For `inference_variables`, the second dimension is `3` because it consists of
+`beta` (a vector of length `2`) and `sigma` (a scalar).
+
+## Neural Approximator
+
+Below, we will define the neural networks that we will use to estimate the posterior distribution of our linear regression parameters.
+At a high level, our architecture consists of a summary network $\mathbf{h}$ and an inference network $\mathbf{f}$ which jointly learn to invert a generative model. The summary network transforms input data $\mathbf{x}$ of potentially variable size to a fixed-length representations. The inference network generates random draws from an approximate posterior $\mathbf{q}$ via a conditional generative networks (here, an invertible network).
+
+### Summary Network
+
+Since our likelihood generates data exchangeably, we need to respect the permutation invariance of the data. Exchangeability in data means that the probability distribution of a sequence of observations remains the same regardless of the order in which the observations appear. In other words, the data is permutation invariant. For that, we will use a `SetTransformer` which does exactly that (a `DeepSet` is a cheaper version for simpler problems). 
+
+This network will take (at least) 3D tensors of shape `(batch_size, num_obs, D)` and reduce them to 2D tensors of shape `(batch_size, summary_dim)`, where `summary_dim` is a hyperparameter to be set by the user (you). Heuristically, this number should not be lower than the number of parameters in a model. Below, we create a permutation-invariant network with `summary_dim = 10`:
+
+```{python}
+#| ExecuteTime: {end_time: '2025-02-14T10:51:30.796895Z', start_time: '2025-02-14T10:51:30.768493Z'}
+summary_network = bf.networks.SetTransformer(summary_dim=10)
+```
+
+### Inference Network
+
+To actually approximate the posterior distribution, we need to define a generative neural network. Here we choose a simple coupling flow network. For more complicated models and corresponding posteriors, we may need to choose a different, more flexible generative network, for example `bf.networks.FlowMatching()`.
+
+```{python}
+#| ExecuteTime: {end_time: '2025-02-14T10:51:30.822403Z', start_time: '2025-02-14T10:51:30.817183Z'}
+inference_network = bf.networks.CouplingFlow(transform="spline")
+```
+
+### Workflow
+
+Workflow objects make life easier by combining inference networks and summary networks into approximators (internally).
+
+```{python}
+workflow = bf.BasicWorkflow(
+    simulator=simulator,
+    adapter=adapter,
+    inference_network=inference_network,
+    summary_network=summary_network,
+    standardize=["inference_variables", "summary_variables"]
+)
+```
+
+Now, we are ready to train our approximator to learn posterior distributions for linear regression models. To achieve this, we will call `approximator.fit` passing the `simulator` and a bunch of hyperparameters that control how long we want to train.
+
+**Note**: when using JAX and the shape of your data differs in every batch (e.g., when observations vary), you will observe some compilation overhead during the first few steps. The total training time for this example is between 2-5 minutes on a standard laptop.
+
+```{python}
+history = workflow.fit_online(epochs=50, batch_size=64, num_batches_per_epoch=200)
+```
+
+```{python}
+#| ExecuteTime: {end_time: '2025-02-14T10:52:51.132695Z', start_time: '2025-02-14T10:52:51.021865Z'}
+f = bf.diagnostics.plots.loss(history)
+```
+
+## Diagnostics
+
+Let's check out the resulting inference. Say we want to obtain 1000 posterior samples from our approximated posterior of a simulated dataset where we know the ground truth values.
+
+You can also explore the automated diagnostics available through the methods:
+
+- `compute_default_diagnostics()`
+- `plot_default_diagnostics()`
+
+```{python}
+#| ExecuteTime: {end_time: '2025-02-14T10:52:53.883475Z', start_time: '2025-02-14T10:52:51.135969Z'}
+# Set the number of posterior draws you want to get
+num_samples = 1000
+
+# Simulate validation data (unseen during training)
+val_sims = simulator.sample(200)
+
+# Obtain num_samples samples of the parameter posterior for every validation dataset
+post_draws = workflow.sample(conditions=val_sims, num_samples=num_samples)
+
+# post_draws is a dictionary of draws with one element per named parameters
+post_draws.keys()
+```
+
+```{python}
+print(post_draws["beta"].shape)
+```
+
+Initial sanity checks of the posterior samples look good. `post_draws["beta"]` has shape `(200, 1000, 2)` which makes sense since we asked for inference of a 200 data sets (first dimension is 200), for which we wanted to generated 1000 posterior samples (second dimension is 1000). The third dimension is 2, since the `beta` variable was defined as a vector of length 2 (intercept and slope).
+
+```{python}
+#| ExecuteTime: {end_time: '2025-02-14T10:52:53.900435Z', start_time: '2025-02-14T10:52:53.897592Z'}
+post_draws["sigma"].min()
+```
+
+The minimun posterior sample of `sigma` is positive indicating that our positivity enforcing constraing in the data adapter has indeed worked.
+
+Let's plot the joint posterior distribution of `beta` (both intercept and slope). Based on how we generated this particular dataset, we would expect the posteriors of `beta` to vary around its true values from `val_sims["beta"]`. Of course, if this was real data, we wouldn't know the ground truth values. Still, it is always a good idea to first perform inference on simulated data as a diagnostic for whether the approximator has learned to approximate the true posteriors well enough. We will examplariy check the posterior of the first dataset:
+
+```{python}
+#| ExecuteTime: {end_time: '2025-02-14T10:52:55.721139Z', start_time: '2025-02-14T10:52:53.940545Z'}
+#| colab: {base_uri: https://localhost:8080/, height: 335}
+f = bf.diagnostics.plots.pairs_posterior(
+    estimates=post_draws, 
+    targets=val_sims,
+    dataset_id=0,
+    variable_names=par_names,
+)
+```
+
+The true parameter values of the first dataset are indeed well covered by the posterior. Let's check this more systematically for all validation datasets:
+
+**Note**: We are validating recovery for a given $N$ that happened to be drawn in the validation phase. Naturally, results will vary for different $N$, but you can simply leverage the power of amortization to check recovery over the entire range of plausble observation numbers. For an actual scientific application, you would want to train longer.
+
+```{python}
+#| ExecuteTime: {end_time: '2025-02-14T10:52:55.986034Z', start_time: '2025-02-14T10:52:55.734063Z'}
+#| colab: {base_uri: https://localhost:8080/}
+f = bf.diagnostics.plots.recovery(
+    estimates=post_draws, 
+    targets=val_sims,
+    variable_names=par_names
+)
+```
+
+Accuracy looks good for most datasets There is some more variation especially for $\beta_1$ and $\sigma$ but this is not necessarily a reason for concern. Keep in mind that perfect accuracy is not the goal of bayesflow inference. Rather, the goal is to estimate the correct posterior as close as possible. And this correct posterior might very well be far away from the true value for some datasets. In fact, we would fully expect the true value to sometimes be at the tail of the posterior. 
+
+If this was not the case, than our posterior approximation may be too wide. Unfortunately, in many cases we don't have access to the correct posterior, so we need a method that provides us with an indication of the posterior approximations' accuracy without. This is where simulation-based calibration (SBC) comes into play. In short, if the true values are simulated from the prior used during inference (as is the case for our validatian data above), We would expect the rank of the true parameter value to be uniformly distributed from 1 to `num_samples`.
+
+There are multiple graphical methods that use this property for diagnostics. For example, we can use histograms together with an uncertainty band within which we would expect the histogram bars to be if the rank statistics were indeed uniform.
+
+```{python}
+#| ExecuteTime: {end_time: '2025-02-14T10:52:56.162934Z', start_time: '2025-02-14T10:52:55.995686Z'}
+f = bf.diagnostics.plots.calibration_histogram(
+    estimates=post_draws, 
+    targets=val_sims,
+    variable_names=par_names
+)
+```
+
+The histograms look quite good overall, but could be a bit more uniform. That said, the SBC histograms have some drawbacks on how the confidence bands are computed, so we recommend using another kind of plot that is based on the empirical cumulative distribution function (ECDF). For the ECDF, we can compute better confidence bands than for histograms, so the SBC ECDF plot is usually preferable. [This SBC interpretation guide by Martin Modrák](https://hyunjimoon.github.io/SBC/articles/rank_visualizations.html) gives further background information and also practical examples of how to interpret the SBC plots.
+
+```{python}
+#| ExecuteTime: {end_time: '2025-02-14T10:52:56.524217Z', start_time: '2025-02-14T10:52:56.172599Z'}
+f = bf.diagnostics.plots.calibration_ecdf(
+    estimates=post_draws, 
+    targets=val_sims,
+    variable_names=par_names,
+    difference=True,
+    rank_type="distance"
+)
+```
+
+### Custom Test Quantities for SBC
+
+By default, Bayesflow's SBC diagnostics are only checking the calibration of the parameters directly. 
+However, in principle, we can check every univariate quantity that is a function of parameters. This
+even includes data-dependent quantities. Checking SBC for data-dependent quantities is recommended
+because it can uncover many problems with the posterior approximation that purely parameter SBC cannot.
+
+One powerful data-dependent test quantity is the joint log likelihood. Of course, it is only available
+in models that emit an analytic likelihood. But since we are performing ABI for linear regression here,
+we can use it in this case study. For other models without an anlytic likelihood, alternative test quantities
+can be considered, for example, predictive RMSEs or something more specific to the model at hand. 
+Regardless of which quantity is encoded, the correponding function always follows the same logic: 
+We input a input dictionary with numpy array elements that each have the same (first) batch dimension.
+As output, the function needs to supply a one-dimensional array of batch size length.
+
+```{python}
+def joint_log_likelihood(data):
+    beta = data["beta"]
+    sigma = data["sigma"]
+    x = data["x"]
+    y = data["y"]
+    mean = beta[:,0][:,None] + beta[:,1][:,None] * x
+    log_lik = np.sum(- (y - mean)**2 / (2 * sigma**2) - 0.5 * np.log(2 * np.pi) - np.log(sigma), axis=-1)
+    return log_lik
+```
+
+```{python}
+joint_log_likelihood(val_sims).shape
+```
+
+We sampled `num_samples` samples from the posterior for each condition (data). Since we want to pass posterior samples and conditions to a test quantity function that depends on both of them, we will repeat the conditions to adhere to the same shape.
+
+```{python}
+val_sims_conditions = val_sims.copy()
+val_sims_conditions.pop("beta")
+val_sims_conditions.pop("sigma")
+# N is only necessary for simulating data. It is not necessary to keep it for our test quantity.
+val_sims_conditions.pop("N")
+val_sims_conditions = keras.tree.map_structure(
+    lambda tensor: np.repeat(np.expand_dims(tensor, axis=1), num_samples, axis=1), 
+    val_sims_conditions
+)
+post_draws_conditions = post_draws | val_sims_conditions
+```
+
+```{python}
+keras.tree.map_structure(keras.ops.shape, post_draws_conditions)
+```
+
+Now that we have a batched function for the test quantity, as well as samples in the correct shapes to apply to them to, we can make an extended calibration checking plot. In addition to the `joint_log_likelihood` as test quantity, we will also use the sum of $\beta_0$ and $\beta_1$ as an
+additional (non-data dependent) test quantity just to showcase the flexibility of the feature.
+
+```{python}
+f = bf.diagnostics.plots.calibration_ecdf(
+    estimates=post_draws_conditions, 
+    targets=val_sims,
+    test_quantities={  # this argument is new
+        r"$\beta_0 + \beta_1$": lambda data: np.sum(data["beta"], axis=-1),
+        r"$\log p(x|\beta,\sigma)$": joint_log_likelihood,
+    },
+    variable_keys=[],  # we just want to show SBC for the custom test quantities
+    difference=True,
+    rank_type="distance"
+)
+```
+
+The plots confirm that the approximate posteriors are overall well calibrated, even the joint log likelihood almost is. 
+In fact, posterior approximations have to be highly accurate to ensure good calibration of the joint log likelihood. 
+If, for example, we would have used an affine flow as inference network instead of a spline flow, we would
+have seen stronger miscalibration in the joint log likelihood but not in the parameters. Try it out as an exercise.
+
+### Checking Posterior Concentration
+
+After having convinced us that the posterior approximation are overall reasonable, we can check how much and what kind of information in the data we encode in the posterior. Specifically, we might want to look at two interesting scores: (a) The posterior contraction, which measures how much smaller the posterior variance is relative to the prior variance (higher values indicate more contraction relative to the prior). (b) The posterior z-score which indicates the standardized difference between the posterior mean and the true parameter value. Since the posterior z-score requires the true parameter values, it can only be computed in simulated data settings. Here, we show the results for the $\beta$ coefficients only to illustrate the use of the `variable_keys` argument.
+
+```{python}
+#| ExecuteTime: {end_time: '2025-02-14T10:52:56.667625Z', start_time: '2025-02-14T10:52:56.533821Z'}
+f = bf.diagnostics.plots.z_score_contraction(
+    estimates=post_draws, 
+    targets=val_sims,
+    variable_keys=["beta"],
+    variable_names=par_names[0:2]
+)
+```
+
+We clearly see strong posterior contraction in almost all posteriors of $\beta_0$ and in most posteriors of $\beta_1$. In the latter case, there are some notable exceptions where little learning from prior to posterior has taken place. Most likely this is because the variance of the sample predictor value $x$ was small, leading to reduced information about the slope $\beta_1$. 
+
+In terms of posterior z-score, most estimates are between -2 and 2, which makes sense if our posterior is approximately normal and well calibrated. However, again, there are some notable exceptions with quite large posterior z-scores over greater than 3 in absolute values. These may be cases, where the learned posterior approximation was not yet fully accurate. So likely, these extreme cases would vanish if we trained our approximator a little longer. 
+
+### Saving and Loading the Trained Networks
+
+For saving and later on reloading bayesflow approximators, we provide some convenient functionalities. For saving, we use:
+
+```{python}
+# Recommended - full serialization (checkpoints folder must exist)
+filepath = Path("checkpoints") / "regression.keras"
+filepath.parent.mkdir(exist_ok=True)
+workflow.approximator.save(filepath=filepath)
+
+# Not recommended due to adapter mismatches - weights only
+# approximator.save_weights(filepath="checkpoints/regression.h5")
+```
+
+For loading, we then use:
+
+```{python}
+# Load approximator
+approximator = keras.saving.load_model(filepath)
+```
+
+All the usual methods continue to work on the loaded approximator. For example:
+
+```{python}
+# Again, obtain num_samples samples of the parameter posterior for every validation dataset
+post_draws = approximator.sample(conditions=val_sims, num_samples=num_samples)
+
+f = bf.diagnostics.plots.recovery(
+    estimates=post_draws, 
+    targets=val_sims,
+    variable_names=par_names
+)
+```
+
+
