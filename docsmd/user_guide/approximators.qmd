@@ -1,0 +1,11 @@
+---
+title: Approximators
+jupyter: python3
+---
+
+
+*Disclaimer: This guide is in an early stage. We welcome contributions to the guide in form of issues and pull requests.*
+
+Neural approximators provide an approximation of a distribution or a value. To achieve this, they combine the things we have discussed in the previous chapters: simulated data, adapters, summary networks and inference networks. Approximators are at the heart of BayesFlow, as they organize the different components and provide the `fit()` function used for training.
+
+
