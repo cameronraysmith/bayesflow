@@ -1,0 +1,38 @@
+---
+title: Diagnostics and Visualizations
+jupyter: python3
+---
+
+
+*Disclaimer: This guide is in an early stage. We welcome contributions to the guide in form of issues and pull requests.*
+
+There are many factors that influence whether training succeeds and how well we can approximate a target. In this light, checking the results and diagnosing potential problems is an important part of the workflow.
+
+## Loss
+
+While the loss cannot show that the training has succeeded, it can indicate that something has gone wrong. Warning signs are an unstable loss with large upward jumps, and a lack of convergence (the loss still changes significantly at the end of training). We recommend to supply a validation dataset to the training, to diagnose potential overfitting. You can plot the loss using the {py:func}`bayesflow.diagnostics.loss` function.
+
+## Posterior
+
+For inference on simulated data, we can plot the posterior alongside the ground truth values. This can serve as a diagnostic for whether the approximator has learned to approximate the true posteriors well enough. The {py:func}`~bayesflow.diagnostics.pairs_posterior` function displays a set of one- and two-dimensional marginal posterior distributions.
+
+## Recovery
+
+For inference on simulated data, we can visualize how well the ground truth values are recovered over a larger number of datasets. {py:func}`~bayesflow.diagnostics.recovery` is a convencience function for this kind of plot.
+
+## Simulation-based Calibration (SBC)
+
+Simulation-based calibration provides an indication of the posterior approximations' accuracy, without requiring access to the ground-truth posterior. In short, if the true values are simulated from the prior used during inference, we would expect the rank of the true parameter value to be uniformly distributed from 1 to `num_samples`. There are multiple graphical methods that use this property for diagnostics. For example, we can use histograms together with an uncertainty band within which we would expect the histogram bars to be if the rank statistics were indeed uniform. This plot is provided by the {py:func}`~bayesflow.diagnostics.calibration_histogram` function.
+
+SBC histograms have some drawbacks on how the confidence bands are computed, so we recommend using another kind of plot that is based on the empirical cumulative distribution function (ECDF). For the ECDF, we can compute better confidence bands than for histograms, so the SBC ECDF plot is usually preferable. [This SBC interpretation guide by Martin Modrák](https://hyunjimoon.github.io/SBC/articles/rank_visualizations.html) gives further background information and also practical examples of how to interpret the SBC plots. To display SBC ECDF plots, use the {py:func}`~bayesflow.diagnostics.calibration_ecdf` function.
+
+## Posterior Contraction & z-Score
+
+After having convinced us that the posterior approximation are overall reasonable, we can check how much and what kind of information in the data we encode in the posterior. Specifically, we might want to look at two interesting scores:
+
+- The posterior contraction, which measures how much smaller the posterior variance is relative to the prior variance (higher values indicate more contraction relative to the prior).
+- The posterior z-score which indicates the standardized difference between the posterior mean and the true parameter value. Since the posterior z-score requires the true parameter values, it can only be computed in simulated data settings.
+
+The {py:func}`~bayesflow.diagnostics.z_score_contraction` function provides a combined plot of both.
+
+
