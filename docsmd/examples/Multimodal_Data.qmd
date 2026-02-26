@@ -1,0 +1,199 @@
+---
+title: Posterior Estimation With Multimodal Data
+jupyter: python3
+---
+
+
+_Author: Valentin Pratz_
+
+Observed data can come in many forms, like single observations, multiple _exchangeable_ observations or time series.
+A fusion network can combine all those forms into a joint learned summary space, by combining the outputs of different specialized summary networks.
+This requires some pre-processing steps, which we will demonstrate in this tutorial.
+
+
+## Toy Problem
+
+We will construct a simple toy problem, in which we have to determine the mean $\mu$ and the standard deviation $\sigma$ of a two-dimensional Gaussian distribution. For this, we simulate data from two experiments:
+
+- Experiment A: `n_exchangeable` exchangeable samples from the distribution.
+- Experiment B: A time series of the cumulative sum of `n_time_series` draws from the distribution.
+
+Both experiments will share the parameters $\mu$ and $\sigma$.
+
+```{python}
+import bayesflow as bf
+import keras
+import numpy as np
+import matplotlib.pyplot as plt
+```
+
+```{python}
+rng = np.random.default_rng(2025)
+
+
+def prior():
+    return {"mu": rng.normal(size=2), "sigma": rng.gamma(5, 0.1)}
+```
+
+```{python}
+def likelihood_a(mu, sigma, n_exchangeable=5):
+    return {"observables_a": rng.normal(mu, sigma, size=(n_exchangeable, 2))}
+
+
+def likelihood_b(mu, sigma, n_time_series=20, **kwargs):
+    return {
+        "observables_b": np.cumsum(
+            rng.normal(mu, sigma, size=(n_time_series, 2)), axis=0
+        ),
+        "time_b": np.linspace(0.0, 1.0, n_time_series)[:, None],
+    }
+```
+
+We construct a simulator from the prior and the likelihoods in the usual way.
+
+```{python}
+simulator = bf.make_simulator([prior, likelihood_a, likelihood_b])
+```
+
+We can simulate and visualize a few example datasets:
+
+```{python}
+n_examples = 3
+data = simulator.sample(n_examples)
+```
+
+```{python}
+cmap = plt.cm.Set1
+for i in range(n_examples):
+    plt.scatter(
+        data["observables_a"][i, :, 0],
+        data["observables_a"][i, :, 1],
+        marker="x",
+        color=cmap(i),
+        label=f"Dataset {i+1}",
+    )
+plt.title("Experiment A")
+plt.xlabel("$x_1$")
+plt.ylabel("$x_2$")
+plt.legend();
+```
+
+```{python}
+fig, axs = plt.subplots(2, 1, sharex=True)
+for i in range(n_examples):
+    for j in range(2):
+        axs[j].plot(
+            data["time_b"][i, :, 0].T,
+            data["observables_b"][i, :, j].T,
+            marker="x",
+            color=cmap(i),
+            linestyle="dotted",
+            label=f"Dataset {i+1}",
+        )
+        axs[j].set(ylabel=f"$z_{j+1}$")
+axs[0].legend()
+axs[1].set(xlabel="$t$")
+fig.suptitle("Experiment B")
+fig.tight_layout();
+```
+
+## Summary Networks
+
+We start by setting up the individual summary networks, which will be the _backbones_ of the fusion network. For Experiment A, we use a `SetTransformer`, which is constructed for exchangeable observations. For Experiment B, we use a `TimeSeriesTransformer`, which is designed to handle time series data. For the latter, we set `time_axis=-1`, indicating that we will concatenate the time to the data at the end of the vector. We will do this below using the adapter.
+
+```{python}
+summary_network_a = bf.networks.SetTransformer(summary_dim=6)
+summary_network_b = bf.networks.TimeSeriesTransformer(summary_dim=6, time_axis=-1)
+```
+
+To combine the outputs of both networks, we define another neural network, the _head_. It will get the concatenated outputs of our summary networks as inputs.
+
+```{python}
+summary_dim = 6
+head = keras.Sequential(
+    [bf.networks.MLP(widths=[128, 128]), keras.layers.Dense(units=summary_dim)]
+)
+```
+
+Now, pass all the networks to the `FusionNetwork`. We use a dictionary for the summary networks, so that we can specify which input belongs to which summary network. The keys can be chosen arbitrarily, here we use `input_a` and `input_b`.
+
+```{python}
+summary_network = bf.networks.FusionNetwork(
+    backbones={"input_a": summary_network_a, "input_b": summary_network_b},
+    head=head,
+)
+```
+
+## Pre-processing with the Adapter
+
+We now have to transform the simulator outputs to the structure required by BayesFlow:
+
+- the parameter vector goes to `inference_variables`
+- the inputs to the summary networks go to `summary_variables`
+
+As we now have multiple simulator outputs with incompatible shapes, `summary_variables` has to be a dictionary with the keys we used above for the summary networks.
+So it should have the contents:
+
+- `input_a`: pre-processed oberservations from Experiment A that are passed to the `SetTransformer`
+- `input_b`: pre-processed oberservations from Experiment B that are passed to the `TimeSeriesTransformer`
+
+Note that most transforms in the adapter cannot handle nested structures (i.e., dicts) for now, so we have to create the `summary_variables` dictionary after all pre-processing has been done.
+
+The simulator outputs variables with the following shapes (3 is the batch dimension):
+
+```{python}
+print(keras.tree.map_structure(keras.ops.shape, data))
+```
+
+```{python}
+adapter = (
+    bf.adapters.Adapter.create_default(["mu", "sigma"])
+    .rename("observables_a", "input_a")
+    .concatenate(["observables_b", "time_b"], into="input_b")
+    .group(
+        ["input_a", "input_b"], into="summary_variables"
+    )  # this transform should go last
+)
+```
+
+The adapter produces the following output, just as we expect it:
+
+```{python}
+print(keras.tree.map_structure(keras.ops.shape, adapter(data)))
+```
+
+## Training
+
+We have a summary network and the appropriate adapter, which are the two parts in our pipeline that are different for multimodal problems. From now on, the pipeline works as in any other BayesFlow workflow.
+
+```{python}
+workflow = bf.BasicWorkflow(
+    simulator=simulator,
+    adapter=adapter,
+    summary_network=summary_network,
+    standardize="all",
+)
+```
+
+```{python}
+history = workflow.fit_online(epochs=50, validation_data=64)
+```
+
+## Evaluation
+
+We plot the default diagnostic to assess whether training has been successful. Please refer to the introductory notebooks for details on the interpretation.
+
+```{python}
+bf.diagnostics.plots.loss(history, figsize=(8, 3));
+```
+
+```{python}
+workflow.plot_custom_diagnostics(
+    512,
+    plot_fns={
+        "recovery": bf.diagnostics.plots.recovery,
+        "calibration_ecdf": bf.diagnostics.plots.calibration_ecdf,
+    },
+);
+```
+
