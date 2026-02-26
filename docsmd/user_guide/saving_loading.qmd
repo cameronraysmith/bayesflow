@@ -1,0 +1,15 @@
+---
+title: Saving & Loading Models
+jupyter: python3
+---
+
+
+*Disclaimer: This guide is in an early stage. We welcome contributions to the guide in form of issues and pull requests.*
+
+Saving and loading of models takes place via our backend, [Keras 3](https://keras.io/). Objects that can be saved have a `save` method, which allows saving to a `.keras` file.
+
+The [`keras.saving.load_model`](https://keras.io/api/models/model_saving_apis/model_saving_and_loading/#load_model-function) function can be used to load the stored models. There is a lot more to say about this topic. For now, refer to the respective [Keras guide](https://keras.io/guides/serialization_and_saving/).
+
+**Important:** We try to avoid it, but changes to model architectures can lead to a situation where the model is not successfully loaded after updating BayesFlow. This can also happen silently (i.e., without an error/warning being shown), so we recommend to conduct a quick sanity check on the model outputs after loading. In practice, pinning the BayesFlow version for each project can also help to avoid problems in this regard.
+
+
