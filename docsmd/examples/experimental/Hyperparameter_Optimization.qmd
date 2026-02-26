@@ -1,0 +1,260 @@
+---
+title: Hyperparameter Optimization Using Optuna
+jupyter: python3
+---
+
+
+_Author: Stefan T. Radev_
+
+
+This is a quick tutorial demonstrating how to combine automatic hyperparameter optimization using the awesome `optuna` package with `BayesFlow`.
+
+Optuna is a powerful and easy-to-use framework for automatic hyperparameter optimization. It provides efficient search algorithms, such as Tree-structured Parzen Estimator (TPE) and Bayesian optimization, to find the best hyperparameters for machine learning models. Optuna is particularly useful for deep learning applications, as it allows users to define search spaces, implement pruning strategies, and parallelize optimization runs.
+
+For more details, check out the official Optuna documentation: https://optuna.org.
+
+```{python}
+# Install if not already installed
+%pip install optuna -q
+```
+
+```{python}
+import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
+
+# Ensure the backend is set
+import os
+if "KERAS_BACKEND" not in os.environ:
+    # set this to "torch", "tensorflow", or "jax"
+    os.environ["KERAS_BACKEND"] = "jax"
+
+import keras
+import optuna
+
+import bayesflow as bf
+```
+
+### Simulator and Data
+First, we simulate mini training and validation data sets.
+
+```{python}
+# Prepare simulator - using our favorite two moons
+batch_size = 128
+simulator = bf.benchmarks.simulators.TwoMoons()
+
+# Prepare data dictionaries
+train_samples = simulator.sample(1024)
+val_samples = simulator.sample(512)
+
+# Prepare data adapter to connect data with networks
+adapter = (
+    bf.adapters.Adapter()
+    .convert_dtype("float64", "float32")
+    .rename("parameters", "inference_variables")
+    .rename("observables", "inference_conditions")
+)
+
+# Prepare data sets
+train_dataset = bf.datasets.OfflineDataset(
+    data=train_samples, 
+    batch_size=batch_size, 
+    adapter=adapter
+)
+
+val_dataset = bf.datasets.OfflineDataset(
+    data=val_samples, 
+    batch_size=batch_size, 
+    adapter=adapter
+)
+```
+
+### Test Objective
+We then define an "objective function" that will carry out the entire training and return the average validation loss over the last 5 epochs. This objective function will play the role of our "black box" function that we are going to minimize.
+
+```{python}
+def objective(epochs=30):
+    """Dummy objective function without adaptive parameters."""
+
+    # Hardcode hyperparameters
+    max_time = 10
+    width = 256
+    depth = 6
+    dropout = 0.05
+    initial_learning_rate = 5e-4
+    
+    # Create inference net
+    sigma2 = keras.ops.var(train_samples["parameters"].astype("float32"), axis=0, keepdims=True)
+    inference_network = bf.networks.ConsistencyModel(
+        subnet_kwargs={"widths": (width,)*depth, "dropout": dropout},
+        total_steps=epochs*train_dataset.num_batches,
+        max_time=max_time,
+        sigma2=sigma2,
+    )
+    
+    # Create optimizer
+    scheduled_lr = keras.optimizers.schedules.CosineDecay(
+        initial_learning_rate=initial_learning_rate,
+        decay_steps=epochs*train_dataset.num_batches,
+        alpha=1e-8
+    )
+    optimizer = keras.optimizers.Adam(learning_rate=scheduled_lr)
+    
+    
+    # Create approximator
+    approximator = bf.ContinuousApproximator(
+        inference_network=inference_network,
+        adapter=adapter,
+    )
+    approximator.compile(optimizer=optimizer)
+    
+    # Train and compute the average of last 5 validation losses
+    history = approximator.fit(
+        epochs=epochs,
+        dataset=train_dataset,
+        validation_data=val_dataset,
+        verbose=0
+    )
+    return np.mean(history.history["val_loss"][-5:])
+```
+
+```{python}
+print("Validation loss: {}".format(objective()))
+```
+
+###  Optuna Objective
+Nextm we will create an optuna objective that will optimize some of the parameters. The objective is the same as before, but we will train for more epochs and take the average of the last 10 validation losses
+
+You can read more about `optuna`'s trial and study objects here:
+https://optuna.readthedocs.io/en/stable/tutorial/index.html
+
+```{python}
+def objective(trial, epochs=100):
+    """Optuna-friendly objective functions with adaptive parameters."""
+    
+    # Optimize hyperparameters
+    max_time = trial.suggest_int("max_time", 1, 30)
+    width = trial.suggest_int("width", 128, 512)
+    depth = trial.suggest_int("depth", 2, 8)
+    dropout = trial.suggest_float("dropout", 0.01, 0.5)
+    initial_learning_rate = trial.suggest_float("lr", 1e-4, 1e-3) 
+    
+    # Create inference net
+    sigma2 = keras.ops.var(train_samples["parameters"].astype("float32"), axis=0, keepdims=True)
+    inference_network = bf.networks.ConsistencyModel(
+        subnet_kwargs={"widths": (width,)*depth, "dropout": dropout},
+        total_steps=epochs*train_dataset.num_batches,
+        max_time=max_time,
+        sigma2=sigma2,
+    )
+    
+    # Create optimizer
+    scheduled_lr = keras.optimizers.schedules.CosineDecay(
+        initial_learning_rate=initial_learning_rate,
+        decay_steps=epochs*train_dataset.num_batches,
+        alpha=1e-8
+    )
+    optimizer = keras.optimizers.Adam(learning_rate=scheduled_lr)
+    
+    
+    # Create approximator
+    approximator = bf.ContinuousApproximator(
+        inference_network=inference_network,
+        adapter=adapter,
+    )
+    approximator.compile(optimizer=optimizer)
+    
+    # Train and compute the average of last 5 validation losses
+    history = approximator.fit(
+        epochs=epochs,
+        dataset=train_dataset,
+        validation_data=val_dataset,
+        verbose=0
+    )
+    return np.mean(history.history["val_loss"][-10:])
+```
+
+## Optimization
+This will take some time...
+
+```{python}
+study = optuna.create_study(direction="minimize")
+
+study.optimize(objective, n_trials=42)
+```
+
+```{python}
+trial = study.best_trial
+print("Validation loss: {}".format(trial.value))
+print("Best hyperparameters: {}".format(trial.params))
+```
+
+## Training With Best Parameters
+
+```{python}
+# Create inference net
+epochs = 100
+sigma2 = keras.ops.var(train_samples["parameters"].astype("float32"), axis=0, keepdims=True)
+inference_network = bf.networks.ConsistencyModel(
+    subnet_kwargs={"widths": (trial.params["width"],)*trial.params["depth"], "dropout": trial.params["dropout"]},
+    total_steps=epochs*train_dataset.num_batches,
+    max_time=trial.params["max_time"],
+    sigma2=sigma2,
+)
+
+# Create optimizer
+scheduled_lr = keras.optimizers.schedules.CosineDecay(
+    initial_learning_rate=trial.params["lr"],
+    decay_steps=epochs*train_dataset.num_batches,
+    alpha=1e-8
+)
+optimizer = keras.optimizers.Adam(learning_rate=scheduled_lr)
+
+
+# Create approximator
+approximator = bf.ContinuousApproximator(
+    inference_network=inference_network,
+    adapter=adapter,
+)
+approximator.compile(optimizer=optimizer)
+
+# Train and compute the average of last 5 validation losses
+history = approximator.fit(
+    epochs=epochs,
+    dataset=train_dataset,
+    validation_data=val_dataset,
+)
+```
+
+### Quick Validation
+
+```{python}
+# Set the number of posterior draws you want to get
+num_samples = 3000
+
+# Obtain samples from amortized posterior
+conditions = {"observables": np.array([[0.0, 0.0]]).astype("float32")}
+
+# Prepare figure
+f, ax = plt.subplots(1, 1, figsize=(6, 6))
+
+# Obtain samples
+samples = approximator.sample(conditions=conditions, num_samples=num_samples)["parameters"]
+
+# Plot samples
+ax.scatter(samples[0, :, 0], samples[0, :, 1], color="#7a1515", alpha=0.75, s=0.5)
+sns.despine(ax=ax)
+ax.grid(alpha=0.3)
+ax.set_aspect("equal", adjustable="box")
+ax.set_xlim([-0.5, 0.5])
+ax.set_ylim([-0.5, 0.5])
+ax.set_xlabel(r"$\theta_1$", fontsize=15)
+ax.set_ylabel(r"$\theta_2$", fontsize=15)
+
+f.tight_layout()
+```
+
+```{python}
+#TODO - Use a different objective
+```
+
