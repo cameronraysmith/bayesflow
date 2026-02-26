@@ -1,0 +1,30 @@
+---
+title: Workflows
+jupyter: python3
+---
+
+
+*Disclaimer: This guide is in an early stage. We welcome contributions to the guide in form of issues and pull requests.*
+
+Workflows are an abstraction on top of the approximator, that expose methods for training and inference in a more abstract, and therefore simplified, fashion.
+
+## BasicWorkflow
+
+For now, {py:class}`~bayesflow.workflows.BasicWorkflow` is the only available workflow. In its most basic form, you provide it with four things: simulator, adapter, inference network and summary network (if you use one).
+
+```python
+workflow = bf.BasicWorkflow(
+    simulator=simulator,
+    adapter=adapter,
+    inference_network=inference_network,
+    summary_network=summary_network,
+)
+```
+
+You can then use the {py:meth}`~bayesflow.workflows.BasicWorkflow.fit_online` method to run the training. After training, the you can sample from the workflow using {py:meth}`~bayesflow.workflows.BasicWorkflow.sample`.
+
+Note that after the training, the work of the workflow is done, and you can just use the trained approximator (accessible via `workflow.approximator`) for downstream tasks. If you want to save you trained output, you would use the `approximator` as well, i.e., store it using `workflow.approximator.save(filepath=filepath)`. You can then use {py:meth}`~bayesflow.approximators.ContinuousApproximator.sample` and related methods directly from the approximator.
+
+{py:class}`~bayesflow.workflows.BasicWorkflow` is highly configurable, refer to the API reference for details. For practical usage, take a look at the {doc}`../examples`.
+
+
