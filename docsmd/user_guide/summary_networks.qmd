@@ -1,0 +1,13 @@
+---
+title: Summary Networks
+jupyter: python3
+---
+
+
+*Disclaimer: This guide is in an early stage. We welcome contributions to the guide in form of issues and pull requests.*
+
+Learnable summary statistics provide several advantages for amortized Bayesian inference. By reducing the dimensionality of the data, they enable more efficient processing by the inference network. Additionally, they can encode knowledge about the data (e.g., that different observations are exchangeable) directly into the network architecture. Finally, the resulting _summary space_ can serve as a diagnostic tool. In some cases, we also require a summary network to convert observations of variable size into a fixed-size representation.
+
+You can find the summary networks in the {py:mod}`~bayesflow.networks` module. You can identify them by the "Bases: {py:class}`~bayesflow.networks.SummaryNetwork`" label.
+
+
